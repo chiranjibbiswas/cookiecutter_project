@@ -1,24 +1,23 @@
 # api/generate.py
-# Vercel-Compatible Python Serverless Function (WSGI with Flask)
+# Fully Vercel-Compatible Cookiecutter Generator
 
 import os
-import tempfile
 import shutil
+import uuid
 import zipfile
+import requests
 from pathlib import Path
-from http import HTTPStatus
-
 from flask import Flask, request, send_file, Response
 from cookiecutter.main import cookiecutter
+from http import HTTPStatus
 
 app = Flask(__name__)
 
+TMP_ROOT = "/tmp"
+
 @app.route("/api/generate", methods=["POST"])
 def generate():
-    try:
-        payload = request.get_json(force=True)
-    except Exception:
-        return Response("Invalid JSON body", status=HTTPStatus.BAD_REQUEST)
+    payload = request.get_json(force=True)
 
     template_url = payload.get("template_url")
     extra_context = payload.get("extra_context") or {}
@@ -26,58 +25,84 @@ def generate():
     if not template_url:
         return Response("`template_url` is required", status=HTTPStatus.BAD_REQUEST)
 
-    # Create isolated temp directories
-    workdir = tempfile.mkdtemp(prefix="genwork_")
-    outdir = tempfile.mkdtemp(prefix="genout_")
+    # Create isolated workspace inside /tmp
+    work_id = str(uuid.uuid4())
+    workdir = os.path.join(TMP_ROOT, f"w_{work_id}")
+    templatedir = os.path.join(workdir, "template")
+    outdir = os.path.join(workdir, "output")
+    zip_path = os.path.join(workdir, "project.zip")
+
+    os.makedirs(templatedir, exist_ok=True)
+    os.makedirs(outdir, exist_ok=True)
 
     try:
-        # Run cookiecutter non-interactively
-        try:
-            cookiecutter(
-                template_url,
-                no_input=True,
-                extra_context=extra_context,
-                output_dir=outdir
-            )
-        except Exception as e:
-            return Response(
-                "Cookiecutter failed: " + str(e),
-                status=HTTPStatus.INTERNAL_SERVER_ERROR
-            )
+        # ------------------------------------------------------
+        # 1. Convert GitHub repo URL → ZIP download URL
+        # ------------------------------------------------------
+        # Supports both:
+        # https://github.com/user/repo
+        # https://github.com/user/repo.git
+        base = template_url.rstrip("/").replace(".git", "")
+        zip_url = base + "/archive/refs/heads/main.zip"
 
-        # Identify generated folder(s)
-        entries = list(Path(outdir).iterdir())
-        if not entries:
-            return Response("Cookiecutter produced no files", status=500)
+        # ------------------------------------------------------
+        # 2. Download ZIP into /tmp
+        # ------------------------------------------------------
+        zip_file = os.path.join(workdir, "template.zip")
+        r = requests.get(zip_url)
+        if r.status_code != 200:
+            return Response(f"Cannot download template ZIP from {zip_url}", status=500)
 
-        # Create zip file
-        zip_path = Path(workdir) / "project.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for entry in entries:
-                if entry.is_dir():
-                    for root, dirs, files in os.walk(entry):
-                        for file in files:
-                            file_path = Path(root) / file
-                            arcname = file_path.relative_to(outdir)
-                            zf.write(file_path, arcname)
-                else:
-                    arcname = entry.relative_to(outdir)
-                    zf.write(entry, arcname)
+        with open(zip_file, "wb") as f:
+            f.write(r.content)
 
-        # Send ZIP to client
+        # ------------------------------------------------------
+        # 3. Unzip into /tmp/template
+        # ------------------------------------------------------
+        shutil.unpack_archive(zip_file, templatedir)
+
+        # Find root folder inside extracted template
+        inner_folders = os.listdir(templatedir)
+        if not inner_folders:
+            return Response("Bad template: ZIP is empty", 500)
+
+        template_root = os.path.join(templatedir, inner_folders[0])
+
+        # ------------------------------------------------------
+        # 4. Run cookiecutter non-interactively (no git required)
+        # ------------------------------------------------------
+        cookiecutter(
+            template_root,
+            no_input=True,
+            extra_context=extra_context,
+            output_dir=outdir
+        )
+
+        # ------------------------------------------------------
+        # 5. Zip the generated project
+        # ------------------------------------------------------
+        generated = os.listdir(outdir)
+        if not generated:
+            return Response("Cookiecutter produced no files", 500)
+
+        project_folder = os.path.join(outdir, generated[0])
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for root, dirs, files in os.walk(project_folder):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, outdir)
+                    z.write(file_path, arcname)
+
+        # ------------------------------------------------------
+        # 6. Return the zip
+        # ------------------------------------------------------
         return send_file(
-            str(zip_path),
+            zip_path,
             mimetype="application/zip",
             as_attachment=True,
             download_name="project.zip"
         )
 
-    finally:
-        # Ensure cleanup
-        shutil.rmtree(workdir, ignore_errors=True)
-        shutil.rmtree(outdir, ignore_errors=True)
-
-
-# For development testing (not used in Vercel)
-if __name__ == "__main__":
-    app.run(port=8000, debug=True)
+    except Exception as e:
+        return Response(str(e), 500)
