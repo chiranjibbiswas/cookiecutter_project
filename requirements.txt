@@ -1,5 +1,5 @@
-requests
 cookiecutter
+requests
 jinja2
 python-slugify
 binaryornot

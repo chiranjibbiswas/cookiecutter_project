@@ -17,7 +17,8 @@
   "routes": [
     {
       "src": "/api/generate",
-      "dest": "/api/generate.py"
+      "dest": "/api/generate.py",
+      "methods": ["POST"]
     },
     {
       "src": "/static/(.*)",
